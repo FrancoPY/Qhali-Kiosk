@@ -1,637 +1,680 @@
-/* =========================================================
-   XSpace BIO (ESP32 + AFE4490 + AD8232 + MLX90614)
-   - SpO2, R, Frecuencia Cardíaca (FC), PTT, FR y TEMPERATURA
-   - PPG o ECG se pueden graficar por Aurora (seleccionable)
-   - Fs fijo = 250 Hz
-   ========================================================= */
-
-#include <Arduino.h>
-#include <XSpaceBioV10.h>
-#include <XSpaceIoT.h>
-#include <math.h>
-
-// ---------- Nuevas librerías para MLX90614 ----------
-#include <Wire.h>
-#include <Adafruit_MLX90614.h>
-// ----------------------------------------------------
-
-#define USE_AURORA 0 // 1 para enviar datos a Aurora, 0 para desactivar
-#if USE_AURORA
-   const char* WIFI_SSID 	= "Diego";
-   const char* WIFI_PSWD 	= "diego079";
-   const char* AURORA_IP 	= "10.89.116.212";
-   const uint16_t AURORA_PORT = 15600; 		// Debe coincidir con Aurora
-   const uint32_t UDP_PERIOD_MS = 20; 		// ~50 Hz para gráfica
-#endif
-
-// -------- Selección de señal para graficar en Aurora --------
-enum GraphSignal { ECG, PPG };
-GraphSignal GRAFICA = PPG; // por defecto PPG
-
-// -------- Muestreo y ventanas PPG --------
-const uint16_t FS 		 = 250; 	// Hz (ECG y PPG sincronizados)
-const float 	ALPHA_DC = 0.99f; 	// EMA para DC (seguimiento lento)
-
-// Ventanas definidas en SEGUNDOS (se escalan con Fs)
-const float WIN_RMS_SEC = 2.0f; 	// 2 s para RMS
-const float WIN_REF_SEC = 5.0f; 	// 5 s para referencia de R
-
-const int WIN_RMS = (int)(WIN_RMS_SEC * FS); 	// muestras
-const int WIN_REF = (int)(WIN_REF_SEC * FS); 	// muestras
-
-const uint32_t REPORT_INTERVAL_MS 	= 1000; 	// SpO2/R/FC cada 1 s
-const uint32_t PTT_REPORT_INTERVAL_MS = 10000; 	// PTT cada 10 s
-const uint32_t TEMP_REPORT_MS         = 5000;   // Reporte de Temperatura cada 5 s
-const uint32_t JSON_REPORT_INTERVAL_MS = 15000; // Reporte JSON cada 15 s
-
-// -------- Límites / protecciones ----- 
-const float SAT_THRESH = 8.3e6f; 	// saturación cruda
-const float MIN_SIGNAL = 10.0f; 	// umbral mínimo de AC_rms
-
-// -------- LEDs ---------- 
-const uint8_t LED_IR_PCT 	= 60;
-const uint8_t LED_RED_PCT = 60;
-
-// -------- Objetos ---------- 
-XSEthernet 		XSerial;
-XSpaceBioV10Board MyBoard;
-// Objeto MLX90614
-Adafruit_MLX90614 mlx = Adafruit_MLX90614(); 
-
-// -------- Variables Globales de Estado y Resultados --------
-float last_temp_C = NAN; // Temperatura
-float last_FR = NAN; // Frecuencia Respiratoria (FR)
-float last_P_sistolica = NAN; // Presión Sistólica
-float last_P_diastolica = NAN; // Presión Diastólica
-float lastPTT 	= NAN; 		// último PTT en segundos
-
-// -------- Estados PPG ---------- 
-float dc_red = 0.0f, dc_ir = 0.0f;
-float buf_r[WIN_RMS], buf_i[WIN_RMS];
-int 	idx_rms = 0, filled_rms = 0;
-float sumsq_r = 0.0f, sumsq_i = 0.0f;
-float buf_R[WIN_REF];
-int 	idx_ref = 0, filled_ref = 0;
-
-// -------- Filtro LPF (IIR 1er orden) para PPG -------- 
-const float FC_LPF = 8.0f; 	// Hz (ajusta 5–10 Hz)
-float alpha_lp 	 = 0.0f; 	// se calcula en setup()
-float y_lpf_ir 	 = 0.0f; 	// salida del filtro (estado)
-
-// Coeficientes para cálculo de SpO2
-float A_SPO2 = -38.64635211f;
-float B_SPO2 = 120.0373378f;
-
-inline float clamp_pos(float x) { return (x > 1e-12f) ? x : 1e-12f; }
-
-// -------- Lógica de estabilidad -------- 
-const int NUM_MEASUREMENTS = 5;
-float spo2_values[NUM_MEASUREMENTS];
-float r_values[NUM_MEASUREMENTS];
-int 	n_valid_spo2 = 0;
-bool stable_R = false;
-unsigned long last_stable_R_time = 0;
-
-// -------- Variables para FC (a partir de ECG) --------
-const double THRESHOLD_HR 		= 2.10; 	// ajusta según amplitud ECG
-const unsigned long REFRACTORY_MS = 300; 		// 300 ms ~ 200 lpm
-
-double lastECGVoltage 	= 0.0;
-bool 	wasAboveThreshold = false;
-unsigned long lastBeatTime = 0;
-unsigned long prevBeatTime = 0; 
-double lastBPM = 0.0; // Frecuencia Cardíaca (FC)
-
-// -------- Variables para PTT (ECG + PPG) --------
-const unsigned long PPG_SEARCH_MIN_MS = 50; 	// empezar a buscar pulso PPG 50 ms después del R
-const unsigned long PPG_SEARCH_MAX_MS = 400; 	// dejar de buscar a los 400 ms
-
-bool 			waitingPPG 		= false;
-float 		ppg_peak_value 	= -1e9f;
-unsigned long ppg_peak_time_ms 	= 0;
-
-double ptt_sum 	= 0.0; 		// acumulador para promedio 10 s
-unsigned long ptt_count = 0; 	// número de PTT válidos en la ventana
-
-// Coeficientes de la regresión lineal para estimar la presión arterial
-const float a_systolic = 10.03;
-const float b_systolic = 118.44;
-const float a_diastolic = -203.70;
-const float b_diastolic = 146.47;
-
-// --------------------------------------------------------
-// ------------- VARIABLES PARA FR ------------------
-// --------------------------------------------------------
-
-// Decimación para señales respiratorias (para reducir carga de CPU)
-const int RESP_FS = 25; 			// frecuencia efectiva para FR (Hz)
-const int DECIM_FACTOR = FS / RESP_FS; 	// = 10
-const int FR_WIN = 5 * RESP_FS; 		// 5 s ventana -> 125 muestras
-
-float fr_buf_am[FR_WIN];
-float fr_buf_bw[FR_WIN];
-float fr_buf_fm[FR_WIN];
-int fr_idx = 0;
-int fr_filled = 0;
-int decim_counter = 0;
-
-// buffer temporal para cálculo de FM (RR)
-float rr_last = NAN;
-unsigned long last_FR_time = 0;
-const uint32_t FR_REPORT_MS = 5000; // reportar cada 5 s
-unsigned long last_fr_report = 0;
-
-// --------------------------------------------------------
-// FUNCIONES AUXILIARES
-// --------------------------------------------------------
-
-float calculate_average(const float values[], int length) {
-	if (length <= 0) return NAN;
-	float sum = 0.0f;
-	for (int i = 0; i < length; i++) sum += values[i];
-	return sum / (float)length;
-}
-
-void min_max_array(const float values[], int length, float &vmin, float &vmax) {
-	vmin = 	1e9f;
-	vmax = -1e9f;
-	for (int i = 0; i < length; i++) {
-		if (values[i] < vmin) vmin = values[i];
-		if (values[i] > vmax) vmax = values[i];
-	}
-}
-void pushRMS(float ac_r, float ac_i) {
-	float oldr = buf_r[idx_rms], oldi = buf_i[idx_rms];
-	if (filled_rms < WIN_RMS) {
-		buf_r[idx_rms] = ac_r; 	buf_i[idx_rms] = ac_i;
-		sumsq_r += ac_r * ac_r; sumsq_i += ac_i * ac_i;
-		filled_rms++;
-	} else {
-		sumsq_r += ac_r * ac_r - oldr * oldr;
-		sumsq_i += ac_i * ac_i - oldi * oldi;
-		buf_r[idx_rms] = ac_r; 	buf_i[idx_rms] = ac_i;
-	}
-	idx_rms = (idx_rms + 1) % WIN_RMS;
-}
-
-void pushR(float R) {
-	if (!isnan(R)) {
-		buf_R[idx_ref] = R;
-		if (filled_ref < WIN_REF) filled_ref++;
-		idx_ref = (idx_ref + 1) % WIN_REF;
-	}
-}
-
-float meanRref() {
-	if (!filled_ref) return NAN;
-	double s = 0.0;
-	for (int k = 0; k < filled_ref; ++k) s += buf_R[k];
-	return (float)(s / filled_ref);
-}
-
-void resetBuffers() {
-	sumsq_r = sumsq_i = 0.0f;
-	filled_rms = 0; idx_rms = 0;
-	filled_ref = 0; idx_ref = 0;
-}
-
-// --------------------------------------------------------
-// FUNCIONES FR
-// --------------------------------------------------------
-
-// empujar muestras decimadas (AM,BW,FM)
-void pushRespiratorySignals(float am, float bw, float fm) {
-	fr_buf_am[fr_idx] = am;
-	fr_buf_bw[fr_idx] = bw;
-	fr_buf_fm[fr_idx] = fm;
-	if (fr_filled < FR_WIN) fr_filled++;
-	fr_idx = (fr_idx + 1) % FR_WIN;
-}
-
-// Estimador simple de frecuencia dominante (DFT naive). Usa fs = RESP_FS.
-float estimateRespFreq(const float *x, int N) {
-	if (N < 8) return NAN;
-	float fs = (float)RESP_FS;
-	float best_f = NAN;
-	float best_p = -1e30f;
-
-	// k representa índice de frecuencia: f = k * fs / N
-	for (int k = 1; k < N/2; ++k) {
-		float freq = (float)k * fs / (float)N;
-		// rango respiratorio plausible (0.08 - 0.8 Hz) -> 5 - 48 bpm, ajustable
-		if (freq < 0.08f || freq > 0.8f) continue;
-
-		float re = 0.0f, im = 0.0f;
-		for (int n = 0; n < N; ++n) {
-			float ang = -2.0f * 3.14159265f * (float)k * (float)n / (float)N;
-			re += x[n] * cosf(ang);
-			im += x[n] * sinf(ang);
-		}
-		float power = re*re + im*im;
-		if (power > best_p) {
-			best_p = power;
-			best_f = freq;
-		}
-	}
-	return best_f;
-}
-
-// fusion simple de las tres estimaciones (AM,BW,FM)
-float compute_FR_hz() {
-	if (fr_filled < FR_WIN) return NAN;
-
-	float am_arr[FR_WIN], bw_arr[FR_WIN], fm_arr[FR_WIN];
-	// copiar buffers en orden (fr_idx es circular)
-	int start = (fr_idx + FR_WIN - fr_filled) % FR_WIN;
-	for (int i = 0; i < fr_filled; ++i) {
-		int idx = (start + i) % FR_WIN;
-		am_arr[i] = fr_buf_am[idx];
-		bw_arr[i] = fr_buf_bw[idx];
-		fm_arr[i] = fr_buf_fm[idx];
-	}
-	int N = fr_filled;
-
-	float f_am = estimateRespFreq(am_arr, N);
-	float f_bw = estimateRespFreq(bw_arr, N);
-	float f_fm = estimateRespFreq(fm_arr, N);
-
-	int count = 0;
-	float sum = 0.0f;
-	if (!isnan(f_am)) { sum += f_am; count++; }
-	if (!isnan(f_bw)) { sum += f_bw; count++; }
-	if (!isnan(f_fm)) { sum += f_fm; count++; }
-
-	if (count == 0) return NAN;
-	return sum / (float)count;
-}
-
-// --------------------------------------------------------
-// SETUP
-// --------------------------------------------------------
-
-void setup() {
-	Serial.begin(115200);
-	Serial.println();
-	Serial.println("Inicializando placa y sensores...");
-
-	// 1) Inicializar placa y AFE/ECG
-	MyBoard.init();
-	MyBoard.AFE4490_init(CS_AFE4490, PWDN_AFE4490);
-
-	// 2) Configurar LEDs del AFE (una sola vez)
-	MyBoard.AFE4490_Led_intesity(LED_IR_PCT, LED_RED_PCT);
-
-	// 3) ECG activo desde el inicio
-	MyBoard.AD8232_Wake(AD8232_XS1);
-
-	// 4) Inicializar MLX90614 (Temperatura)
-	Serial.print("Inicializando MLX90614 (Temperatura)... ");
-	if (!mlx.begin()) {
-		Serial.println("¡ERROR! No se encontró MLX90614. Revise cableado I2C.");
-	} else {
-		Serial.println("OK");
-	}
-
-	// 5) Semilla DC PPG
-	dc_red 	= (float)MyBoard.AFE4490_GetRED();
-	dc_ir 	= (float)MyBoard.AFE4490_GetIR();
-	y_lpf_ir = 0.0f;
-
-	// 6) Coeficiente LPF depende de Fs
-	alpha_lp = 1.0f - expf(-2.0f * 3.14159265f * FC_LPF / (float)FS);
-
-	// 7) Bootstrap DC PPG (ventana corta inicial)
-	for (int k = 0; k < 150; ++k) { 	// ~0.6 s a 250 Hz
-		float r0 = (float)MyBoard.AFE4490_GetRED();
-		float i0 = (float)MyBoard.AFE4490_GetIR();
-		dc_red = 0.95f * dc_red + 0.05f * r0;
-		dc_ir 	= 0.95f * dc_ir 	+ 0.05f * i0;
-		delay(1000 / FS);
-	}
-
-	Serial.println("Sensores y LEDs listos.");
-
-	// 8) Contador visible de arranque (5 s)
-	for (int i = 5; i > 0; --i) {
-		Serial.print("Esperando inicio... ");
-		Serial.println(i);
-		delay(1000);
-	}
-
-	// 9) WiFi + Aurora (después del conteo)
-#if USE_AURORA
-	XSerial.Wifi_init(WIFI_SSID, WIFI_PSWD);
-	XSerial.UDP_Connect(AURORA_IP, AURORA_PORT);
-#endif
-
-	Serial.println("# Reporte cada 1s: SpO2, R y FC.");
-	Serial.println("# Reporte cada 5s: FR y Tc.");
-    Serial.println("# REPORTE JSON cada 15s al Monitor Serial.");
-}
-// --------------------------------------------------------
-
-void loop() {
-	static uint32_t last_report_ms 			= 0; 	// para SpO2/R/FC cada 1 s
-	static uint32_t last_valid_ms 			= 0; 	// resetear buffers si no hay señal PPG
-	static uint32_t last_ptt_report_ms 	= 0; 	// PTT cada 10 s
-	static uint32_t last_fr_report 			= 0; 	// FR cada 5 s
-	static uint32_t last_temp_report_ms = 0; 	// Reporte de Temperatura
-	static uint32_t last_json_report_ms = 0; 	// NUEVO: Timer para JSON
-#if USE_AURORA
-	static uint32_t last_udp_ms 			= 0; 	// envío continuo a Aurora
-#endif
-
-	unsigned long now_ms = millis();
-
-	// ---------- LECTURA LENTA DE TEMPERATURA (Tc) ----------
-	if (now_ms - last_temp_report_ms >= TEMP_REPORT_MS) {
-		last_temp_C = mlx.readObjectTempC(); 
-		last_temp_report_ms = now_ms;
-	}
-	// -------------------------------------------------------
-
-
-	// ---------- ECG: lectura y cálculo de FC ----------
-	double ecg_v = MyBoard.AD8232_GetVoltage(AD8232_XS1);
-
-	bool above = (ecg_v > THRESHOLD_HR);
-
-	if (above && !wasAboveThreshold) {
-		// detección de R-peak
-		if (lastBeatTime == 0 || (now_ms - lastBeatTime) > REFRACTORY_MS) {
-			if (lastBeatTime != 0) {
-				unsigned long rr = now_ms - lastBeatTime;
-				double bpm = 60000.0 / (double)rr;
-
-				if (lastBPM == 0.0) {
-					lastBPM = bpm;
-				} else {
-					lastBPM = 0.7 * lastBPM + 0.3 * bpm; 	// suavizado
-				}
-			}
-			// --- actualizamos prevBeatTime MÍNIMO
-			prevBeatTime = lastBeatTime;
-			lastBeatTime = now_ms;
-
-			// ----- iniciar búsqueda de pulso PPG para PTT -----
-			waitingPPG 		= true;
-			ppg_peak_value 	= -1e9f;
-			ppg_peak_time_ms = 0;
-		}
-	}
-	wasAboveThreshold = above;
-	lastECGVoltage 		= ecg_v;
-
-	// ---------- PPG: cálculo de R y SpO2 ----------
-	float red = (float)MyBoard.AFE4490_GetRED();
-	float ir 	= (float)MyBoard.AFE4490_GetIR();
-
-	if (fabsf(red) > SAT_THRESH || fabsf(ir) > SAT_THRESH) {
-		delay(1000 / FS);
-		return;
-	}
-
-	dc_red = ALPHA_DC * dc_red + (1.0f - ALPHA_DC) * red;
-	dc_ir 	= ALPHA_DC * dc_ir 	+ (1.0f - ALPHA_DC) * ir;
-
-	float ac_r = red - dc_red;
-	float ac_i = ir 	- dc_ir;
-
-	// RMS para R
-	pushRMS(ac_r, ac_i);
-	float ac_r_rms = (filled_rms > 0) ? sqrtf(fmaxf(sumsq_r / filled_rms, 0.0f)) : 0.0f;
-	float ac_i_rms = (filled_rms > 0) ? sqrtf(fmaxf(sumsq_i / filled_rms, 0.0f)) : 0.0f;
-
-	bool signal_ok = (ac_i_rms > MIN_SIGNAL && ac_r_rms > MIN_SIGNAL);
-
-	float R = NAN;
-	if (signal_ok && dc_red > 1.0f && dc_ir > 1.0f) {
-		float n_red = ac_r_rms / clamp_pos(dc_red);
-		float n_ir 	= ac_i_rms / clamp_pos(dc_ir);
-		R = n_red / n_ir;
-
-		if (isfinite(R)) {
-			pushR(R);
-			last_valid_ms = now_ms;
-		}
-	}
-
-	if (now_ms - last_valid_ms > 15000) {
-		resetBuffers();
-		stable_R 			= false;
-		n_valid_spo2 	= 0;
-	}
-
-	float Ravg 	= meanRref();
-	float SpO2 	= NAN;
-	bool 	have_spo2_now = (!isnan(Ravg));
-
-	if (have_spo2_now) {
-		SpO2 = B_SPO2 + A_SPO2 * Ravg;
-		if (SpO2 < 70.0f) 	SpO2 = 70.0f;
-		if (SpO2 > 100.0f) SpO2 = 100.0f;
-	}
-
-	if (have_spo2_now && isfinite(SpO2) && isfinite(Ravg)) {
-		if (n_valid_spo2 < NUM_MEASUREMENTS) {
-			spo2_values[n_valid_spo2] = SpO2;
-			r_values[n_valid_spo2] 	= Ravg;
-			n_valid_spo2++;
-		} else {
-			for (int i = 0; i < NUM_MEASUREMENTS - 1; i++) {
-				spo2_values[i] = spo2_values[i+1];
-				r_values[i] 	= r_values[i+1];
-			}
-			spo2_values[NUM_MEASUREMENTS - 1] = SpO2;
-			r_values[NUM_MEASUREMENTS - 1] 	= Ravg;
-		}
-	}
-
-	if (n_valid_spo2 == NUM_MEASUREMENTS) {
-		float r_min, r_max;
-		min_max_array(r_values, NUM_MEASUREMENTS, r_min, r_max);
-		if (fabsf(r_max - r_min) < 1.0f) {
-			stable_R = true;
-			last_stable_R_time = now_ms;
-		}
-	}
-
-	float spo2_to_print = SpO2;
-	float R_to_print 		= R;
-
-	// ---------- Filtro LPF para PPG (para PTT y gráfica) ----------
-	y_lpf_ir += alpha_lp * (ac_i - y_lpf_ir);
-
-	// --------- DECIMACIÓN PARA FR --------------
-	decim_counter++;
-	if (decim_counter >= DECIM_FACTOR) {
-		decim_counter = 0;
-
-		// Señales respiratorias decimadas:
-		float resp_am = fabsf(ac_i); 	// AM: magnitud AC del IR
-		float resp_bw = dc_ir; 		// BW: componente DC lenta
-		float resp_fm = NAN;
-
-		if (prevBeatTime != 0 && lastBeatTime != 0 && lastBeatTime > prevBeatTime) {
-			float rr_sec = (float)(lastBeatTime - prevBeatTime) / 1000.0f;
-			static float rr_prev = NAN;
-			if (isnan(rr_prev)) rr_prev = rr_sec;
-			resp_fm = rr_sec - rr_prev; 		// variaciones RR
-			rr_prev = rr_sec;
-		}
-
-		float norm_am = resp_am;
-		float norm_bw = resp_bw;
-		if (norm_am == 0.0f) norm_am = 1e-6f;
-		if (norm_bw == 0.0f) norm_bw = 1e-6f;
-
-		if (!isnan(resp_fm)) resp_fm *= 10.0f;
-
-		pushRespiratorySignals(norm_am, norm_bw, resp_fm);
-	}
-
-	// ---------- Cálculo de PTT ----------
-	if (waitingPPG && lastBeatTime != 0) {
-		unsigned long dt = now_ms - lastBeatTime;
-
-		// ventana donde buscamos el pico del pulso PPG
-		if (dt >= PPG_SEARCH_MIN_MS && dt <= PPG_SEARCH_MAX_MS) {
-			if (y_lpf_ir > ppg_peak_value) {
-				ppg_peak_value 	= y_lpf_ir;
-				ppg_peak_time_ms = now_ms;
-			}
-		}
-
-		// termina la ventana de búsqueda
-		if (dt > PPG_SEARCH_MAX_MS) {
-			if (ppg_peak_time_ms > 0) {
-				float ptt = (ppg_peak_time_ms - lastBeatTime) / 1000.0f; 	// en segundos
-				lastPTT = ptt;
-				ptt_sum += ptt;
-				ptt_count++;
-			}
-			waitingPPG = false;
-		}
-	}
-
-	// ---------- Reporte cada 1 segundo: SpO2, R y FC (Monitor Serial) ----------
-	if (now_ms - last_report_ms >= REPORT_INTERVAL_MS) {
-		Serial.print("SpO2 = ");
-		Serial.print(round(spo2_to_print), 2);
-		Serial.print(", R = ");
-		Serial.print(R_to_print, 6);
-		Serial.print(", FC = ");
-		Serial.print(round(lastBPM));
-		Serial.println(" bpm");
-		last_report_ms = now_ms;
-	}
-
-	// ---------- Cálculo y Reporte FR y Tc (Temperatura) cada 5 segundos ----------
-	if (now_ms - last_fr_report >= FR_REPORT_MS) {
-		float fr_hz = compute_FR_hz();
-		
-		Serial.print("FR = ");
-		if (!isnan(fr_hz)) {
-			float fr_bpm = fr_hz * 60.0f;
-			last_FR = fr_bpm; // Guarda en global
-			last_FR_time = now_ms;
-			Serial.print(fr_bpm, 2);
-			Serial.print(" rpm");
-		} else {
-			last_FR = NAN;
-			Serial.print("NaN rpm");
-		}
-
-		// Impresión de Temperatura (Tc)
-		Serial.print(", Tc = ");
-		if (isnan(last_temp_C)) {
-			Serial.println("NaN *C");
-		} else {
-			Serial.print(last_temp_C, 2); 
-			Serial.println("*C");
-		}
-
-		last_fr_report = now_ms;
-	}
-
-	// ---------- Cálculo y Reporte PTT promedio y presión arterial cada 10 segundos ----------
-	if (now_ms - last_ptt_report_ms >= PTT_REPORT_INTERVAL_MS) {
-		if (ptt_count > 0) {
-			float ptt_avg = (float)(ptt_sum / (double)ptt_count);
-			
-			// Cálculo de la presión arterial
-			last_P_sistolica = round(a_systolic * ptt_avg + b_systolic); // Guarda en global
-			last_P_diastolica = round(a_diastolic * ptt_avg + b_diastolic); // Guarda en global
-			
-			// Imprimir PTT y presión arterial (Monitor Serial)
-			Serial.print("PTT_avg_10s = ");
-			Serial.print(ptt_avg, 4);
-			Serial.print(" s, ");
-			Serial.print("P_sistólica = ");
-			Serial.print(last_P_sistolica);
-			Serial.print(" mmHg, ");
-			Serial.print("P_diastólica = ");
-			Serial.print(last_P_diastolica);
-			Serial.println(" mmHg");
-		} else {
-            last_P_sistolica = NAN;
-            last_P_diastolica = NAN;
-			Serial.println("PTT_avg_10s = NaN, P_sistólica = NaN, P_diastólica = NaN");
-		}
-		// reiniciar acumuladores
-		ptt_sum 	= 0.0;
-		ptt_count = 0;
-		last_ptt_report_ms = now_ms;
-	}
-
-    // ---------- REPORTE CONSOLIDADO JSON CADA 15 SEGUNDOS (Monitor Serial) ----------
-    if (now_ms - last_json_report_ms >= JSON_REPORT_INTERVAL_MS) {
-        last_json_report_ms = now_ms;
-
-        // Formatear el JSON usando String() y c_str() para asegurar la precisión de los flotantes
-        char jsonBuffer[128];
-        
-        // Uso de String() para manejar flotantes con precisión en snprintf
-        int len = snprintf(
-            jsonBuffer, sizeof(jsonBuffer),
-            "{\"Psist\":%s,\"Pdiast\":%s,\"FC\":%s,\"FR\":%s,\"SpO2\":%s,\"Tc\":%s}",
-            isnan(last_P_sistolica) ? "null" : String(round(last_P_sistolica)).c_str(),
-            isnan(last_P_diastolica) ? "null" : String(round(last_P_diastolica)).c_str(),
-            isnan(round(lastBPM)) ? "null" : String((float)round(lastBPM)).c_str(), // lastBPM es double, casteamos a float
-            isnan(last_FR) ? "null" : String(round(last_FR)).c_str(),
-            isnan(round(spo2_to_print)) ? "null" : String(round(spo2_to_print)).c_str(),
-            isnan(last_temp_C) ? "null" : String(last_temp_C, 1).c_str()
-        );
-        
-        // El reporte JSON se envía al Monitor Serial
-        Serial.print("JSON_REPORT: ");
-        Serial.println(jsonBuffer);
+{
+ "cells": [
+  {
+   "cell_type": "code",
+   "execution_count": 4,
+   "id": "6300551d",
+   "metadata": {},
+   "outputs": [
+    {
+     "ename": "IndentationError",
+     "evalue": "unindent does not match any outer indentation level (<string>, line 329)",
+     "output_type": "error",
+     "traceback": [
+      "  \u001b[36mFile \u001b[39m\u001b[32m<string>:329\u001b[39m\n\u001b[31m    \u001b[39m\u001b[31mSerial.println(\"# REPORTE JSON cada 15s al Monitor Serial.\");\u001b[39m\n                                                                 ^\n\u001b[31mIndentationError\u001b[39m\u001b[31m:\u001b[39m unindent does not match any outer indentation level\n"
+     ]
     }
-    // ---------------------------------------------------------------------------------
-
-
-	// ---------- Señal para graficar en Aurora (ECG o PPG) ----------
-#if USE_AURORA
-	uint32_t now_udp = now_ms;
-
-	if (now_udp - last_udp_ms >= UDP_PERIOD_MS) {
-		float valueToSend;
-
-		if (GRAFICA == PPG) {
-			valueToSend = y_lpf_ir; 		// PPG filtrada
-		} else {
-			valueToSend = (float)ecg_v; 	// ECG en voltios
-		}
-
-		if (isfinite(valueToSend) && fabsf(valueToSend) < SAT_THRESH) {
-			char out[24];
-			snprintf(out, sizeof(out), "%.3f", valueToSend);
-			XSerial.println(out); // Envía a Aurora
-		}
-		last_udp_ms = now_udp;
-	}
-#endif
-
-	// ---------- Ritmo de muestreo ----------
-	delay(1000 / FS); 	// ~4 ms → 250 Hz
+   ],
+   "source": [
+    "/* =========================================================\n",
+    "   XSpace BIO (ESP32 + AFE4490 + AD8232 + MLX90614)\n",
+    "   - SpO2, R, Frecuencia Cardíaca (FC), PTT, FR y TEMPERATURA\n",
+    "   - PPG o ECG se pueden graficar por Aurora (seleccionable)\n",
+    "   - Fs fijo = 250 Hz\n",
+    "   ========================================================= */\n",
+    "\n",
+    "#include <Arduino.h>\n",
+    "#include <XSpaceBioV10.h>\n",
+    "#include <XSpaceIoT.h>\n",
+    "#include <math.h>\n",
+    "\n",
+    "// ---------- Nuevas librerías para MLX90614 ----------\n",
+    "#include <Wire.h>\n",
+    "#include <Adafruit_MLX90614.h>\n",
+    "// ----------------------------------------------------\n",
+    "\n",
+    "#define USE_AURORA 0 // 1 para enviar datos a Aurora, 0 para desactivar\n",
+    "#if USE_AURORA\n",
+    "   const char* WIFI_SSID \t= \"Diego\";\n",
+    "   const char* WIFI_PSWD \t= \"diego079\";\n",
+    "   const char* AURORA_IP \t= \"10.89.116.212\";\n",
+    "   const uint16_t AURORA_PORT = 15600; \t\t// Debe coincidir con Aurora\n",
+    "   const uint32_t UDP_PERIOD_MS = 20; \t\t// ~50 Hz para gráfica\n",
+    "#endif\n",
+    "\n",
+    "// -------- Selección de señal para graficar en Aurora --------\n",
+    "enum GraphSignal { ECG, PPG };\n",
+    "GraphSignal GRAFICA = PPG; // por defecto PPG\n",
+    "\n",
+    "// -------- Muestreo y ventanas PPG --------\n",
+    "const uint16_t FS \t\t = 250; \t// Hz (ECG y PPG sincronizados)\n",
+    "const float \tALPHA_DC = 0.99f; \t// EMA para DC (seguimiento lento)\n",
+    "\n",
+    "// Ventanas definidas en SEGUNDOS (se escalan con Fs)\n",
+    "const float WIN_RMS_SEC = 2.0f; \t// 2 s para RMS\n",
+    "const float WIN_REF_SEC = 5.0f; \t// 5 s para referencia de R\n",
+    "\n",
+    "const int WIN_RMS = (int)(WIN_RMS_SEC * FS); \t// muestras\n",
+    "const int WIN_REF = (int)(WIN_REF_SEC * FS); \t// muestras\n",
+    "\n",
+    "const uint32_t REPORT_INTERVAL_MS \t= 1000; \t// SpO2/R/FC cada 1 s\n",
+    "const uint32_t PTT_REPORT_INTERVAL_MS = 10000; \t// PTT cada 10 s\n",
+    "const uint32_t TEMP_REPORT_MS         = 5000;   // Reporte de Temperatura cada 5 s\n",
+    "const uint32_t JSON_REPORT_INTERVAL_MS = 15000; // Reporte JSON cada 15 s\n",
+    "\n",
+    "// -------- Límites / protecciones ----- \n",
+    "const float SAT_THRESH = 8.3e6f; \t// saturación cruda\n",
+    "const float MIN_SIGNAL = 10.0f; \t// umbral mínimo de AC_rms\n",
+    "\n",
+    "// -------- LEDs ---------- \n",
+    "const uint8_t LED_IR_PCT \t= 60;\n",
+    "const uint8_t LED_RED_PCT = 60;\n",
+    "\n",
+    "// -------- Objetos ---------- \n",
+    "XSEthernet \t\tXSerial;\n",
+    "XSpaceBioV10Board MyBoard;\n",
+    "// Objeto MLX90614\n",
+    "Adafruit_MLX90614 mlx = Adafruit_MLX90614(); \n",
+    "\n",
+    "// -------- Variables Globales de Estado y Resultados --------\n",
+    "float last_temp_C = NAN; // Temperatura\n",
+    "float last_FR = NAN; // Frecuencia Respiratoria (FR)\n",
+    "float last_P_sistolica = NAN; // Presión Sistólica\n",
+    "float last_P_diastolica = NAN; // Presión Diastólica\n",
+    "float lastPTT \t= NAN; \t\t// último PTT en segundos\n",
+    "\n",
+    "// -------- Estados PPG ---------- \n",
+    "float dc_red = 0.0f, dc_ir = 0.0f;\n",
+    "float buf_r[WIN_RMS], buf_i[WIN_RMS];\n",
+    "int \tidx_rms = 0, filled_rms = 0;\n",
+    "float sumsq_r = 0.0f, sumsq_i = 0.0f;\n",
+    "float buf_R[WIN_REF];\n",
+    "int \tidx_ref = 0, filled_ref = 0;\n",
+    "\n",
+    "// -------- Filtro LPF (IIR 1er orden) para PPG -------- \n",
+    "const float FC_LPF = 8.0f; \t// Hz (ajusta 5–10 Hz)\n",
+    "float alpha_lp \t = 0.0f; \t// se calcula en setup()\n",
+    "float y_lpf_ir \t = 0.0f; \t// salida del filtro (estado)\n",
+    "\n",
+    "// Coeficientes para cálculo de SpO2\n",
+    "float A_SPO2 = -38.64635211f;\n",
+    "float B_SPO2 = 120.0373378f;\n",
+    "\n",
+    "inline float clamp_pos(float x) { return (x > 1e-12f) ? x : 1e-12f; }\n",
+    "\n",
+    "// -------- Lógica de estabilidad -------- \n",
+    "const int NUM_MEASUREMENTS = 5;\n",
+    "float spo2_values[NUM_MEASUREMENTS];\n",
+    "float r_values[NUM_MEASUREMENTS];\n",
+    "int \tn_valid_spo2 = 0;\n",
+    "bool stable_R = false;\n",
+    "unsigned long last_stable_R_time = 0;\n",
+    "\n",
+    "// -------- Variables para FC (a partir de ECG) --------\n",
+    "const double THRESHOLD_HR \t\t= 2.10; \t// ajusta según amplitud ECG\n",
+    "const unsigned long REFRACTORY_MS = 300; \t\t// 300 ms ~ 200 lpm\n",
+    "\n",
+    "double lastECGVoltage \t= 0.0;\n",
+    "bool \twasAboveThreshold = false;\n",
+    "unsigned long lastBeatTime = 0;\n",
+    "unsigned long prevBeatTime = 0; \n",
+    "double lastBPM = 0.0; // Frecuencia Cardíaca (FC)\n",
+    "\n",
+    "// -------- Variables para PTT (ECG + PPG) --------\n",
+    "const unsigned long PPG_SEARCH_MIN_MS = 50; \t// empezar a buscar pulso PPG 50 ms después del R\n",
+    "const unsigned long PPG_SEARCH_MAX_MS = 400; \t// dejar de buscar a los 400 ms\n",
+    "\n",
+    "bool \t\t\twaitingPPG \t\t= false;\n",
+    "float \t\tppg_peak_value \t= -1e9f;\n",
+    "unsigned long ppg_peak_time_ms \t= 0;\n",
+    "\n",
+    "double ptt_sum \t= 0.0; \t\t// acumulador para promedio 10 s\n",
+    "unsigned long ptt_count = 0; \t// número de PTT válidos en la ventana\n",
+    "\n",
+    "// Coeficientes de la regresión lineal para estimar la presión arterial\n",
+    "const float a_systolic = 10.03;\n",
+    "const float b_systolic = 118.44;\n",
+    "const float a_diastolic = -203.70;\n",
+    "const float b_diastolic = 146.47;\n",
+    "\n",
+    "// --------------------------------------------------------\n",
+    "// ------------- VARIABLES PARA FR ------------------\n",
+    "// --------------------------------------------------------\n",
+    "\n",
+    "// Decimación para señales respiratorias (para reducir carga de CPU)\n",
+    "const int RESP_FS = 25; \t\t\t// frecuencia efectiva para FR (Hz)\n",
+    "const int DECIM_FACTOR = FS / RESP_FS; \t// = 10\n",
+    "const int FR_WIN = 5 * RESP_FS; \t\t// 5 s ventana -> 125 muestras\n",
+    "\n",
+    "float fr_buf_am[FR_WIN];\n",
+    "float fr_buf_bw[FR_WIN];\n",
+    "float fr_buf_fm[FR_WIN];\n",
+    "int fr_idx = 0;\n",
+    "int fr_filled = 0;\n",
+    "int decim_counter = 0;\n",
+    "\n",
+    "// buffer temporal para cálculo de FM (RR)\n",
+    "float rr_last = NAN;\n",
+    "unsigned long last_FR_time = 0;\n",
+    "const uint32_t FR_REPORT_MS = 5000; // reportar cada 5 s\n",
+    "unsigned long last_fr_report = 0;\n",
+    "\n",
+    "// --------------------------------------------------------\n",
+    "// FUNCIONES AUXILIARES\n",
+    "// --------------------------------------------------------\n",
+    "\n",
+    "float calculate_average(const float values[], int length) {\n",
+    "\tif (length <= 0) return NAN;\n",
+    "\tfloat sum = 0.0f;\n",
+    "\tfor (int i = 0; i < length; i++) sum += values[i];\n",
+    "\treturn sum / (float)length;\n",
+    "}\n",
+    "\n",
+    "void min_max_array(const float values[], int length, float &vmin, float &vmax) {\n",
+    "\tvmin = \t1e9f;\n",
+    "\tvmax = -1e9f;\n",
+    "\tfor (int i = 0; i < length; i++) {\n",
+    "\t\tif (values[i] < vmin) vmin = values[i];\n",
+    "\t\tif (values[i] > vmax) vmax = values[i];\n",
+    "\t}\n",
+    "}\n",
+    "void pushRMS(float ac_r, float ac_i) {\n",
+    "\tfloat oldr = buf_r[idx_rms], oldi = buf_i[idx_rms];\n",
+    "\tif (filled_rms < WIN_RMS) {\n",
+    "\t\tbuf_r[idx_rms] = ac_r; \tbuf_i[idx_rms] = ac_i;\n",
+    "\t\tsumsq_r += ac_r * ac_r; sumsq_i += ac_i * ac_i;\n",
+    "\t\tfilled_rms++;\n",
+    "\t} else {\n",
+    "\t\tsumsq_r += ac_r * ac_r - oldr * oldr;\n",
+    "\t\tsumsq_i += ac_i * ac_i - oldi * oldi;\n",
+    "\t\tbuf_r[idx_rms] = ac_r; \tbuf_i[idx_rms] = ac_i;\n",
+    "\t}\n",
+    "\tidx_rms = (idx_rms + 1) % WIN_RMS;\n",
+    "}\n",
+    "\n",
+    "void pushR(float R) {\n",
+    "\tif (!isnan(R)) {\n",
+    "\t\tbuf_R[idx_ref] = R;\n",
+    "\t\tif (filled_ref < WIN_REF) filled_ref++;\n",
+    "\t\tidx_ref = (idx_ref + 1) % WIN_REF;\n",
+    "\t}\n",
+    "}\n",
+    "\n",
+    "float meanRref() {\n",
+    "\tif (!filled_ref) return NAN;\n",
+    "\tdouble s = 0.0;\n",
+    "\tfor (int k = 0; k < filled_ref; ++k) s += buf_R[k];\n",
+    "\treturn (float)(s / filled_ref);\n",
+    "}\n",
+    "\n",
+    "void resetBuffers() {\n",
+    "\tsumsq_r = sumsq_i = 0.0f;\n",
+    "\tfilled_rms = 0; idx_rms = 0;\n",
+    "\tfilled_ref = 0; idx_ref = 0;\n",
+    "}\n",
+    "\n",
+    "// --------------------------------------------------------\n",
+    "// FUNCIONES FR\n",
+    "// --------------------------------------------------------\n",
+    "\n",
+    "// empujar muestras decimadas (AM,BW,FM)\n",
+    "void pushRespiratorySignals(float am, float bw, float fm) {\n",
+    "\tfr_buf_am[fr_idx] = am;\n",
+    "\tfr_buf_bw[fr_idx] = bw;\n",
+    "\tfr_buf_fm[fr_idx] = fm;\n",
+    "\tif (fr_filled < FR_WIN) fr_filled++;\n",
+    "\tfr_idx = (fr_idx + 1) % FR_WIN;\n",
+    "}\n",
+    "\n",
+    "// Estimador simple de frecuencia dominante (DFT naive). Usa fs = RESP_FS.\n",
+    "float estimateRespFreq(const float *x, int N) {\n",
+    "\tif (N < 8) return NAN;\n",
+    "\tfloat fs = (float)RESP_FS;\n",
+    "\tfloat best_f = NAN;\n",
+    "\tfloat best_p = -1e30f;\n",
+    "\n",
+    "\t// k representa índice de frecuencia: f = k * fs / N\n",
+    "\tfor (int k = 1; k < N/2; ++k) {\n",
+    "\t\tfloat freq = (float)k * fs / (float)N;\n",
+    "\t\t// rango respiratorio plausible (0.08 - 0.8 Hz) -> 5 - 48 bpm, ajustable\n",
+    "\t\tif (freq < 0.08f || freq > 0.8f) continue;\n",
+    "\n",
+    "\t\tfloat re = 0.0f, im = 0.0f;\n",
+    "\t\tfor (int n = 0; n < N; ++n) {\n",
+    "\t\t\tfloat ang = -2.0f * 3.14159265f * (float)k * (float)n / (float)N;\n",
+    "\t\t\tre += x[n] * cosf(ang);\n",
+    "\t\t\tim += x[n] * sinf(ang);\n",
+    "\t\t}\n",
+    "\t\tfloat power = re*re + im*im;\n",
+    "\t\tif (power > best_p) {\n",
+    "\t\t\tbest_p = power;\n",
+    "\t\t\tbest_f = freq;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\treturn best_f;\n",
+    "}\n",
+    "\n",
+    "// fusion simple de las tres estimaciones (AM,BW,FM)\n",
+    "float compute_FR_hz() {\n",
+    "\tif (fr_filled < FR_WIN) return NAN;\n",
+    "\n",
+    "\tfloat am_arr[FR_WIN], bw_arr[FR_WIN], fm_arr[FR_WIN];\n",
+    "\t// copiar buffers en orden (fr_idx es circular)\n",
+    "\tint start = (fr_idx + FR_WIN - fr_filled) % FR_WIN;\n",
+    "\tfor (int i = 0; i < fr_filled; ++i) {\n",
+    "\t\tint idx = (start + i) % FR_WIN;\n",
+    "\t\tam_arr[i] = fr_buf_am[idx];\n",
+    "\t\tbw_arr[i] = fr_buf_bw[idx];\n",
+    "\t\tfm_arr[i] = fr_buf_fm[idx];\n",
+    "\t}\n",
+    "\tint N = fr_filled;\n",
+    "\n",
+    "\tfloat f_am = estimateRespFreq(am_arr, N);\n",
+    "\tfloat f_bw = estimateRespFreq(bw_arr, N);\n",
+    "\tfloat f_fm = estimateRespFreq(fm_arr, N);\n",
+    "\n",
+    "\tint count = 0;\n",
+    "\tfloat sum = 0.0f;\n",
+    "\tif (!isnan(f_am)) { sum += f_am; count++; }\n",
+    "\tif (!isnan(f_bw)) { sum += f_bw; count++; }\n",
+    "\tif (!isnan(f_fm)) { sum += f_fm; count++; }\n",
+    "\n",
+    "\tif (count == 0) return NAN;\n",
+    "\treturn sum / (float)count;\n",
+    "}\n",
+    "\n",
+    "// --------------------------------------------------------\n",
+    "// SETUP\n",
+    "// --------------------------------------------------------\n",
+    "\n",
+    "void setup() {\n",
+    "\tSerial.begin(115200);\n",
+    "\tSerial.println();\n",
+    "\tSerial.println(\"Inicializando placa y sensores...\");\n",
+    "\n",
+    "\t// 1) Inicializar placa y AFE/ECG\n",
+    "\tMyBoard.init();\n",
+    "\tMyBoard.AFE4490_init(CS_AFE4490, PWDN_AFE4490);\n",
+    "\n",
+    "\t// 2) Configurar LEDs del AFE (una sola vez)\n",
+    "\tMyBoard.AFE4490_Led_intesity(LED_IR_PCT, LED_RED_PCT);\n",
+    "\n",
+    "\t// 3) ECG activo desde el inicio\n",
+    "\tMyBoard.AD8232_Wake(AD8232_XS1);\n",
+    "\n",
+    "\t// 4) Inicializar MLX90614 (Temperatura)\n",
+    "\tSerial.print(\"Inicializando MLX90614 (Temperatura)... \");\n",
+    "\tif (!mlx.begin()) {\n",
+    "\t\tSerial.println(\"¡ERROR! No se encontró MLX90614. Revise cableado I2C.\");\n",
+    "\t} else {\n",
+    "\t\tSerial.println(\"OK\");\n",
+    "\t}\n",
+    "\n",
+    "\t// 5) Semilla DC PPG\n",
+    "\tdc_red \t= (float)MyBoard.AFE4490_GetRED();\n",
+    "\tdc_ir \t= (float)MyBoard.AFE4490_GetIR();\n",
+    "\ty_lpf_ir = 0.0f;\n",
+    "\n",
+    "\t// 6) Coeficiente LPF depende de Fs\n",
+    "\talpha_lp = 1.0f - expf(-2.0f * 3.14159265f * FC_LPF / (float)FS);\n",
+    "\n",
+    "\t// 7) Bootstrap DC PPG (ventana corta inicial)\n",
+    "\tfor (int k = 0; k < 150; ++k) { \t// ~0.6 s a 250 Hz\n",
+    "\t\tfloat r0 = (float)MyBoard.AFE4490_GetRED();\n",
+    "\t\tfloat i0 = (float)MyBoard.AFE4490_GetIR();\n",
+    "\t\tdc_red = 0.95f * dc_red + 0.05f * r0;\n",
+    "\t\tdc_ir \t= 0.95f * dc_ir \t+ 0.05f * i0;\n",
+    "\t\tdelay(1000 / FS);\n",
+    "\t}\n",
+    "\n",
+    "\tSerial.println(\"Sensores y LEDs listos.\");\n",
+    "\n",
+    "\t// 8) Contador visible de arranque (5 s)\n",
+    "\tfor (int i = 5; i > 0; --i) {\n",
+    "\t\tSerial.print(\"Esperando inicio... \");\n",
+    "\t\tSerial.println(i);\n",
+    "\t\tdelay(1000);\n",
+    "\t}\n",
+    "\n",
+    "\t// 9) WiFi + Aurora (después del conteo)\n",
+    "#if USE_AURORA\n",
+    "\tXSerial.Wifi_init(WIFI_SSID, WIFI_PSWD);\n",
+    "\tXSerial.UDP_Connect(AURORA_IP, AURORA_PORT);\n",
+    "#endif\n",
+    "\n",
+    "\tSerial.println(\"# Reporte cada 1s: SpO2, R y FC.\");\n",
+    "\tSerial.println(\"# Reporte cada 5s: FR y Tc.\");\n",
+    "    Serial.println(\"# REPORTE JSON cada 15s al Monitor Serial.\");\n",
+    "}\n",
+    "// --------------------------------------------------------\n",
+    "\n",
+    "void loop() {\n",
+    "\tstatic uint32_t last_report_ms \t\t\t= 0; \t// para SpO2/R/FC cada 1 s\n",
+    "\tstatic uint32_t last_valid_ms \t\t\t= 0; \t// resetear buffers si no hay señal PPG\n",
+    "\tstatic uint32_t last_ptt_report_ms \t= 0; \t// PTT cada 10 s\n",
+    "\tstatic uint32_t last_fr_report \t\t\t= 0; \t// FR cada 5 s\n",
+    "\tstatic uint32_t last_temp_report_ms = 0; \t// Reporte de Temperatura\n",
+    "\tstatic uint32_t last_json_report_ms = 0; \t// NUEVO: Timer para JSON\n",
+    "#if USE_AURORA\n",
+    "\tstatic uint32_t last_udp_ms \t\t\t= 0; \t// envío continuo a Aurora\n",
+    "#endif\n",
+    "\n",
+    "\tunsigned long now_ms = millis();\n",
+    "\n",
+    "\t// ---------- LECTURA LENTA DE TEMPERATURA (Tc) ----------\n",
+    "\tif (now_ms - last_temp_report_ms >= TEMP_REPORT_MS) {\n",
+    "\t\tlast_temp_C = mlx.readObjectTempC(); \n",
+    "\t\tlast_temp_report_ms = now_ms;\n",
+    "\t}\n",
+    "\t// -------------------------------------------------------\n",
+    "\n",
+    "\n",
+    "\t// ---------- ECG: lectura y cálculo de FC ----------\n",
+    "\tdouble ecg_v = MyBoard.AD8232_GetVoltage(AD8232_XS1);\n",
+    "\n",
+    "\tbool above = (ecg_v > THRESHOLD_HR);\n",
+    "\n",
+    "\tif (above && !wasAboveThreshold) {\n",
+    "\t\t// detección de R-peak\n",
+    "\t\tif (lastBeatTime == 0 || (now_ms - lastBeatTime) > REFRACTORY_MS) {\n",
+    "\t\t\tif (lastBeatTime != 0) {\n",
+    "\t\t\t\tunsigned long rr = now_ms - lastBeatTime;\n",
+    "\t\t\t\tdouble bpm = 60000.0 / (double)rr;\n",
+    "\n",
+    "\t\t\t\tif (lastBPM == 0.0) {\n",
+    "\t\t\t\t\tlastBPM = bpm;\n",
+    "\t\t\t\t} else {\n",
+    "\t\t\t\t\tlastBPM = 0.7 * lastBPM + 0.3 * bpm; \t// suavizado\n",
+    "\t\t\t\t}\n",
+    "\t\t\t}\n",
+    "\t\t\t// --- actualizamos prevBeatTime MÍNIMO\n",
+    "\t\t\tprevBeatTime = lastBeatTime;\n",
+    "\t\t\tlastBeatTime = now_ms;\n",
+    "\n",
+    "\t\t\t// ----- iniciar búsqueda de pulso PPG para PTT -----\n",
+    "\t\t\twaitingPPG \t\t= true;\n",
+    "\t\t\tppg_peak_value \t= -1e9f;\n",
+    "\t\t\tppg_peak_time_ms = 0;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\twasAboveThreshold = above;\n",
+    "\tlastECGVoltage \t\t= ecg_v;\n",
+    "\n",
+    "\t// ---------- PPG: cálculo de R y SpO2 ----------\n",
+    "\tfloat red = (float)MyBoard.AFE4490_GetRED();\n",
+    "\tfloat ir \t= (float)MyBoard.AFE4490_GetIR();\n",
+    "\n",
+    "\tif (fabsf(red) > SAT_THRESH || fabsf(ir) > SAT_THRESH) {\n",
+    "\t\tdelay(1000 / FS);\n",
+    "\t\treturn;\n",
+    "\t}\n",
+    "\n",
+    "\tdc_red = ALPHA_DC * dc_red + (1.0f - ALPHA_DC) * red;\n",
+    "\tdc_ir \t= ALPHA_DC * dc_ir \t+ (1.0f - ALPHA_DC) * ir;\n",
+    "\n",
+    "\tfloat ac_r = red - dc_red;\n",
+    "\tfloat ac_i = ir \t- dc_ir;\n",
+    "\n",
+    "\t// RMS para R\n",
+    "\tpushRMS(ac_r, ac_i);\n",
+    "\tfloat ac_r_rms = (filled_rms > 0) ? sqrtf(fmaxf(sumsq_r / filled_rms, 0.0f)) : 0.0f;\n",
+    "\tfloat ac_i_rms = (filled_rms > 0) ? sqrtf(fmaxf(sumsq_i / filled_rms, 0.0f)) : 0.0f;\n",
+    "\n",
+    "\tbool signal_ok = (ac_i_rms > MIN_SIGNAL && ac_r_rms > MIN_SIGNAL);\n",
+    "\n",
+    "\tfloat R = NAN;\n",
+    "\tif (signal_ok && dc_red > 1.0f && dc_ir > 1.0f) {\n",
+    "\t\tfloat n_red = ac_r_rms / clamp_pos(dc_red);\n",
+    "\t\tfloat n_ir \t= ac_i_rms / clamp_pos(dc_ir);\n",
+    "\t\tR = n_red / n_ir;\n",
+    "\n",
+    "\t\tif (isfinite(R)) {\n",
+    "\t\t\tpushR(R);\n",
+    "\t\t\tlast_valid_ms = now_ms;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\n",
+    "\tif (now_ms - last_valid_ms > 15000) {\n",
+    "\t\tresetBuffers();\n",
+    "\t\tstable_R \t\t\t= false;\n",
+    "\t\tn_valid_spo2 \t= 0;\n",
+    "\t}\n",
+    "\n",
+    "\tfloat Ravg \t= meanRref();\n",
+    "\tfloat SpO2 \t= NAN;\n",
+    "\tbool \thave_spo2_now = (!isnan(Ravg));\n",
+    "\n",
+    "\tif (have_spo2_now) {\n",
+    "\t\tSpO2 = B_SPO2 + A_SPO2 * Ravg;\n",
+    "\t\tif (SpO2 < 70.0f) \tSpO2 = 70.0f;\n",
+    "\t\tif (SpO2 > 100.0f) SpO2 = 100.0f;\n",
+    "\t}\n",
+    "\n",
+    "\tif (have_spo2_now && isfinite(SpO2) && isfinite(Ravg)) {\n",
+    "\t\tif (n_valid_spo2 < NUM_MEASUREMENTS) {\n",
+    "\t\t\tspo2_values[n_valid_spo2] = SpO2;\n",
+    "\t\t\tr_values[n_valid_spo2] \t= Ravg;\n",
+    "\t\t\tn_valid_spo2++;\n",
+    "\t\t} else {\n",
+    "\t\t\tfor (int i = 0; i < NUM_MEASUREMENTS - 1; i++) {\n",
+    "\t\t\t\tspo2_values[i] = spo2_values[i+1];\n",
+    "\t\t\t\tr_values[i] \t= r_values[i+1];\n",
+    "\t\t\t}\n",
+    "\t\t\tspo2_values[NUM_MEASUREMENTS - 1] = SpO2;\n",
+    "\t\t\tr_values[NUM_MEASUREMENTS - 1] \t= Ravg;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\n",
+    "\tif (n_valid_spo2 == NUM_MEASUREMENTS) {\n",
+    "\t\tfloat r_min, r_max;\n",
+    "\t\tmin_max_array(r_values, NUM_MEASUREMENTS, r_min, r_max);\n",
+    "\t\tif (fabsf(r_max - r_min) < 1.0f) {\n",
+    "\t\t\tstable_R = true;\n",
+    "\t\t\tlast_stable_R_time = now_ms;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\n",
+    "\tfloat spo2_to_print = SpO2;\n",
+    "\tfloat R_to_print \t\t= R;\n",
+    "\n",
+    "\t// ---------- Filtro LPF para PPG (para PTT y gráfica) ----------\n",
+    "\ty_lpf_ir += alpha_lp * (ac_i - y_lpf_ir);\n",
+    "\n",
+    "\t// --------- DECIMACIÓN PARA FR --------------\n",
+    "\tdecim_counter++;\n",
+    "\tif (decim_counter >= DECIM_FACTOR) {\n",
+    "\t\tdecim_counter = 0;\n",
+    "\n",
+    "\t\t// Señales respiratorias decimadas:\n",
+    "\t\tfloat resp_am = fabsf(ac_i); \t// AM: magnitud AC del IR\n",
+    "\t\tfloat resp_bw = dc_ir; \t\t// BW: componente DC lenta\n",
+    "\t\tfloat resp_fm = NAN;\n",
+    "\n",
+    "\t\tif (prevBeatTime != 0 && lastBeatTime != 0 && lastBeatTime > prevBeatTime) {\n",
+    "\t\t\tfloat rr_sec = (float)(lastBeatTime - prevBeatTime) / 1000.0f;\n",
+    "\t\t\tstatic float rr_prev = NAN;\n",
+    "\t\t\tif (isnan(rr_prev)) rr_prev = rr_sec;\n",
+    "\t\t\tresp_fm = rr_sec - rr_prev; \t\t// variaciones RR\n",
+    "\t\t\trr_prev = rr_sec;\n",
+    "\t\t}\n",
+    "\n",
+    "\t\tfloat norm_am = resp_am;\n",
+    "\t\tfloat norm_bw = resp_bw;\n",
+    "\t\tif (norm_am == 0.0f) norm_am = 1e-6f;\n",
+    "\t\tif (norm_bw == 0.0f) norm_bw = 1e-6f;\n",
+    "\n",
+    "\t\tif (!isnan(resp_fm)) resp_fm *= 10.0f;\n",
+    "\n",
+    "\t\tpushRespiratorySignals(norm_am, norm_bw, resp_fm);\n",
+    "\t}\n",
+    "\n",
+    "\t// ---------- Cálculo de PTT ----------\n",
+    "\tif (waitingPPG && lastBeatTime != 0) {\n",
+    "\t\tunsigned long dt = now_ms - lastBeatTime;\n",
+    "\n",
+    "\t\t// ventana donde buscamos el pico del pulso PPG\n",
+    "\t\tif (dt >= PPG_SEARCH_MIN_MS && dt <= PPG_SEARCH_MAX_MS) {\n",
+    "\t\t\tif (y_lpf_ir > ppg_peak_value) {\n",
+    "\t\t\t\tppg_peak_value \t= y_lpf_ir;\n",
+    "\t\t\t\tppg_peak_time_ms = now_ms;\n",
+    "\t\t\t}\n",
+    "\t\t}\n",
+    "\n",
+    "\t\t// termina la ventana de búsqueda\n",
+    "\t\tif (dt > PPG_SEARCH_MAX_MS) {\n",
+    "\t\t\tif (ppg_peak_time_ms > 0) {\n",
+    "\t\t\t\tfloat ptt = (ppg_peak_time_ms - lastBeatTime) / 1000.0f; \t// en segundos\n",
+    "\t\t\t\tlastPTT = ptt;\n",
+    "\t\t\t\tptt_sum += ptt;\n",
+    "\t\t\t\tptt_count++;\n",
+    "\t\t\t}\n",
+    "\t\t\twaitingPPG = false;\n",
+    "\t\t}\n",
+    "\t}\n",
+    "\n",
+    "\t// ---------- Reporte cada 1 segundo: SpO2, R y FC (Monitor Serial) ----------\n",
+    "\tif (now_ms - last_report_ms >= REPORT_INTERVAL_MS) {\n",
+    "\t\tSerial.print(\"SpO2 = \");\n",
+    "\t\tSerial.print(round(spo2_to_print), 2);\n",
+    "\t\tSerial.print(\", R = \");\n",
+    "\t\tSerial.print(R_to_print, 6);\n",
+    "\t\tSerial.print(\", FC = \");\n",
+    "\t\tSerial.print(round(lastBPM));\n",
+    "\t\tSerial.println(\" bpm\");\n",
+    "\t\tlast_report_ms = now_ms;\n",
+    "\t}\n",
+    "\n",
+    "\t// ---------- Cálculo y Reporte FR y Tc (Temperatura) cada 5 segundos ----------\n",
+    "\tif (now_ms - last_fr_report >= FR_REPORT_MS) {\n",
+    "\t\tfloat fr_hz = compute_FR_hz();\n",
+    "\t\t\n",
+    "\t\tSerial.print(\"FR = \");\n",
+    "\t\tif (!isnan(fr_hz)) {\n",
+    "\t\t\tfloat fr_bpm = fr_hz * 60.0f;\n",
+    "\t\t\tlast_FR = fr_bpm; // Guarda en global\n",
+    "\t\t\tlast_FR_time = now_ms;\n",
+    "\t\t\tSerial.print(fr_bpm, 2);\n",
+    "\t\t\tSerial.print(\" rpm\");\n",
+    "\t\t} else {\n",
+    "\t\t\tlast_FR = NAN;\n",
+    "\t\t\tSerial.print(\"NaN rpm\");\n",
+    "\t\t}\n",
+    "\n",
+    "\t\t// Impresión de Temperatura (Tc)\n",
+    "\t\tSerial.print(\", Tc = \");\n",
+    "\t\tif (isnan(last_temp_C)) {\n",
+    "\t\t\tSerial.println(\"NaN *C\");\n",
+    "\t\t} else {\n",
+    "\t\t\tSerial.print(last_temp_C, 2); \n",
+    "\t\t\tSerial.println(\"*C\");\n",
+    "\t\t}\n",
+    "\n",
+    "\t\tlast_fr_report = now_ms;\n",
+    "\t}\n",
+    "\n",
+    "\t// ---------- Cálculo y Reporte PTT promedio y presión arterial cada 10 segundos ----------\n",
+    "\tif (now_ms - last_ptt_report_ms >= PTT_REPORT_INTERVAL_MS) {\n",
+    "\t\tif (ptt_count > 0) {\n",
+    "\t\t\tfloat ptt_avg = (float)(ptt_sum / (double)ptt_count);\n",
+    "\t\t\t\n",
+    "\t\t\t// Cálculo de la presión arterial\n",
+    "\t\t\tlast_P_sistolica = round(a_systolic * ptt_avg + b_systolic); // Guarda en global\n",
+    "\t\t\tlast_P_diastolica = round(a_diastolic * ptt_avg + b_diastolic); // Guarda en global\n",
+    "\t\t\t\n",
+    "\t\t\t// Imprimir PTT y presión arterial (Monitor Serial)\n",
+    "\t\t\tSerial.print(\"PTT_avg_10s = \");\n",
+    "\t\t\tSerial.print(ptt_avg, 4);\n",
+    "\t\t\tSerial.print(\" s, \");\n",
+    "\t\t\tSerial.print(\"P_sistólica = \");\n",
+    "\t\t\tSerial.print(last_P_sistolica);\n",
+    "\t\t\tSerial.print(\" mmHg, \");\n",
+    "\t\t\tSerial.print(\"P_diastólica = \");\n",
+    "\t\t\tSerial.print(last_P_diastolica);\n",
+    "\t\t\tSerial.println(\" mmHg\");\n",
+    "\t\t} else {\n",
+    "            last_P_sistolica = NAN;\n",
+    "            last_P_diastolica = NAN;\n",
+    "\t\t\tSerial.println(\"PTT_avg_10s = NaN, P_sistólica = NaN, P_diastólica = NaN\");\n",
+    "\t\t}\n",
+    "\t\t// reiniciar acumuladores\n",
+    "\t\tptt_sum \t= 0.0;\n",
+    "\t\tptt_count = 0;\n",
+    "\t\tlast_ptt_report_ms = now_ms;\n",
+    "\t}\n",
+    "\n",
+    "    // ---------- REPORTE CONSOLIDADO JSON CADA 15 SEGUNDOS (Monitor Serial) ----------\n",
+    "    if (now_ms - last_json_report_ms >= JSON_REPORT_INTERVAL_MS) {\n",
+    "        last_json_report_ms = now_ms;\n",
+    "\n",
+    "        // Formatear el JSON usando String() y c_str() para asegurar la precisión de los flotantes\n",
+    "        char jsonBuffer[128];\n",
+    "        \n",
+    "        // Uso de String() para manejar flotantes con precisión en snprintf\n",
+    "        int len = snprintf(\n",
+    "            jsonBuffer, sizeof(jsonBuffer),\n",
+    "            \"{\\\"Psist\\\":%s,\\\"Pdiast\\\":%s,\\\"FC\\\":%s,\\\"FR\\\":%s,\\\"SpO2\\\":%s,\\\"Tc\\\":%s}\",\n",
+    "            isnan(last_P_sistolica) ? \"null\" : String(round(last_P_sistolica)).c_str(),\n",
+    "            isnan(last_P_diastolica) ? \"null\" : String(round(last_P_diastolica)).c_str(),\n",
+    "            isnan(round(lastBPM)) ? \"null\" : String((float)round(lastBPM)).c_str(), // lastBPM es double, casteamos a float\n",
+    "            isnan(last_FR) ? \"null\" : String(round(last_FR)).c_str(),\n",
+    "            isnan(round(spo2_to_print)) ? \"null\" : String(round(spo2_to_print)).c_str(),\n",
+    "            isnan(last_temp_C) ? \"null\" : String(last_temp_C, 1).c_str()\n",
+    "        );\n",
+    "        \n",
+    "        // El reporte JSON se envía al Monitor Serial\n",
+    "        Serial.print(\"JSON_REPORT: \");\n",
+    "        Serial.println(jsonBuffer);\n",
+    "    }\n",
+    "    // ---------------------------------------------------------------------------------\n",
+    "\n",
+    "\n",
+    "\t// ---------- Señal para graficar en Aurora (ECG o PPG) ----------\n",
+    "#if USE_AURORA\n",
+    "\tuint32_t now_udp = now_ms;\n",
+    "\n",
+    "\tif (now_udp - last_udp_ms >= UDP_PERIOD_MS) {\n",
+    "\t\tfloat valueToSend;\n",
+    "\n",
+    "\t\tif (GRAFICA == PPG) {\n",
+    "\t\t\tvalueToSend = y_lpf_ir; \t\t// PPG filtrada\n",
+    "\t\t} else {\n",
+    "\t\t\tvalueToSend = (float)ecg_v; \t// ECG en voltios\n",
+    "\t\t}\n",
+    "\n",
+    "\t\tif (isfinite(valueToSend) && fabsf(valueToSend) < SAT_THRESH) {\n",
+    "\t\t\tchar out[24];\n",
+    "\t\t\tsnprintf(out, sizeof(out), \"%.3f\", valueToSend);\n",
+    "\t\t\tXSerial.println(out); // Envía a Aurora\n",
+    "\t\t}\n",
+    "\t\tlast_udp_ms = now_udp;\n",
+    "\t}\n",
+    "#endif\n",
+    "\n",
+    "\t// ---------- Ritmo de muestreo ----------\n",
+    "\tdelay(1000 / FS); \t// ~4 ms → 250 Hz\n",
+    "}"
+   ]
+  }
+ ],
+ "metadata": {
+  "kernelspec": {
+   "display_name": "Python 3",
+   "language": "python",
+   "name": "python3"
+  },
+  "language_info": {
+   "codemirror_mode": {
+    "name": "ipython",
+    "version": 3
+   },
+   "file_extension": ".py",
+   "mimetype": "text/x-python",
+   "name": "python",
+   "nbconvert_exporter": "python",
+   "pygments_lexer": "ipython3",
+   "version": "3.12.10"
+  }
+ },
+ "nbformat": 4,
+ "nbformat_minor": 5
 }

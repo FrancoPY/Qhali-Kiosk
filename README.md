@@ -7,13 +7,13 @@ El objetivo principal es abordar la problemática del triaje manual y fragmentad
 ---
 ## 👥 Integrantes del Proyecto QhaliKiosk
 
-| Nombre                | Afiliación                                      | Correo electrónico              |
-|-----------------------|-------------------------------------------------|---------------------------------|
-| Dhiago G. Llanos      | Facultad de Ciencia e Ingeniería, UPCH          | dhiago.llanos@upch.pe           |
-| Salet C. Garcia       | Facultad de Ciencia e Ingeniería, UPCH          | salet.garcia@upch.pe            |
-| Diego F. Munayco      | Facultad de Ciencia e Ingeniería, UPCH          | diego.munayco@upch.pe           |
-| Jennifer I. Cancino   | Facultad de Ciencia e Ingeniería, UPCH          | jennifer.cancino@upch.pe        |
-| Franco P. Peralta     | Facultad de Ciencia e Ingeniería, UPCH          | franco.peralta@upch.pe          |
+| Nombre              | Afiliación                                   | Correo electrónico           | LinkedIn                                                                 |
+|---------------------|----------------------------------------------|------------------------------|--------------------------------------------------------------------------|
+| Dhiago G. Llanos    | Facultad de Ciencia e Ingeniería, UPCH       | dhiago.llanos@upch.pe        | [linkedin.com/in/dhiagollanos](https://www.linkedin.com/in/dhiagollanos) |
+| Salet C. Garcia     | Facultad de Ciencia e Ingeniería, UPCH       | salet.garcia@upch.pe         | [linkedin.com/in/salet-garcia-reyes-08b97234a](https://www.linkedin.com/in/salet-garcia-reyes-08b97234a) |
+| Diego F. Munayco    | Facultad de Ciencia e Ingeniería, UPCH       | diego.munayco@upch.pe        | [linkedin.com/in/diego-fabrizio-munayco-saravia-06181a399](https://www.linkedin.com/in/diego-fabrizio-munayco-saravia-06181a399) |
+| Jennifer I. Cancino | Facultad de Ciencia e Ingeniería, UPCH       | jennifer.cancino@upch.pe     | [linkedin.com/in/jenniffer-ivonne-cancino-cordero-181507395](https://www.linkedin.com/in/jenniffer-ivonne-cancino-cordero-181507395) |
+| Franco P. Peralta   | Facultad de Ciencia e Ingeniería, UPCH       | franco.peralta@upch.pe       | [linkedin.com/in/franco-peralta-yauyo-408114390](https://www.linkedin.com/in/franco-peralta-yauyo-408114390) |
 ---
 
 ## ✨ Características Clave
