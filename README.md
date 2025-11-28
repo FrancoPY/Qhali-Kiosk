@@ -5,6 +5,16 @@
 El objetivo principal es abordar la problemática del triaje manual y fragmentado en el primer nivel de atención, donde la adquisición de signos vitales suele ser manual, dependiente del personal, y donde persisten barreras de idioma y acceso.
 
 ---
+## 👥 Integrantes del Proyecto QhaliKiosk
+
+| Nombre                | Afiliación                                      | Correo electrónico              |
+|-----------------------|-------------------------------------------------|---------------------------------|
+| Dhiago G. Llanos      | Facultad de Ciencia e Ingeniería, UPCH          | dhiago.llanos@upch.pe           |
+| Salet C. Garcia       | Facultad de Ciencia e Ingeniería, UPCH          | salet.garcia@upch.pe            |
+| Diego F. Munayco      | Facultad de Ciencia e Ingeniería, UPCH          | diego.munayco@upch.pe           |
+| Jennifer I. Cancino   | Facultad de Ciencia e Ingeniería, UPCH          | jennifer.cancino@upch.pe        |
+| Franco P. Peralta     | Facultad de Ciencia e Ingeniería, UPCH          | franco.peralta@upch.pe          |
+---
 
 ## ✨ Características Clave
 
